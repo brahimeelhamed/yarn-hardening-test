@@ -1,0 +1,304 @@
+name: Check Yarn Hardening
+on:
+  pull_request:
+    branches:
+      - master
+      - main
+  merge_group:
+    types: [checks_requested]
+
+permissions: {}
+
+concurrency:
+  group: check-yarn-hardening-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  yarn-hardening:
+    name: Check yarn hardening
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Valeur minimale de npmMinimalAgeGate, en minutes (4320 = 3 jours).
+      MIN_AGE_MINUTES: '4320'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.11'
+
+      - name: Install PyYAML
+        run: pip install 'pyyaml==6.0.2'
+
+      - name: Verify yarn supply-chain hardening
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/check_yarn_hardening.py" <<'PY'
+          """Yarn hardening - verification de la configuration .yarnrc.yml."""
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          import yaml
+
+          # Valeur exigee pour npmMinimalAgeGate, en MINUTES (4320 = 3 jours).
+          # Un nombre nu est interprete en minutes par toutes les versions >= 4.10 ;
+          # une duree texte ("3d") n'est comprise qu'a partir de 4.12 (avant, parseInt
+          # la transforme silencieusement en 3 minutes - yarnpkg/berry#6991).
+          MIN_AGE_MINUTES = int(os.environ.get("MIN_AGE_MINUTES", "4320"))
+
+          # 4.10.0 introduit npmMinimalAgeGate, 4.10.3 corrige son comportement sur les
+          # tags et prereleases : c'est le vrai minimum utilisable.
+          MIN_VERSION = (4, 10, 3)
+          # A partir de 4.12, npmMinimalAgeGate accepte les durees texte ("3d", "1w").
+          DURATION_VERSION = (4, 12, 0)
+
+          SKIP_DIRS = {".git", "node_modules", ".yarn", "dist", "build", "coverage",
+                       ".next", ".nuxt", "vendor"}
+          _UNITS = {"w": 10080, "d": 1440, "h": 60, "m": 1, "s": 1 / 60}
+
+
+          def fmt_version(ver):
+              return ".".join(map(str, ver)) if ver else "inconnue"
+
+
+          def iter_files(root):
+              for dirpath, dirnames, filenames in os.walk(root):
+                  dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+                  base = Path(dirpath).relative_to(root)
+                  for f in sorted(filenames):
+                      yield base / f
+
+
+          def find_projects(root):
+              """Racine de projet = dossier contenant un yarn.lock."""
+              return sorted({p.parent for p in iter_files(root) if p.name == "yarn.lock"})
+
+
+          def chain(project):
+              """Dossiers du projet jusqu'a la racine du repo, du plus proche au plus loin."""
+              return [project] + list(project.parents)
+
+
+          def is_classic(root, project):
+              """Yarn Classic (v1) : lockfile au format v1."""
+              try:
+                  head = (root / project / "yarn.lock").read_text(encoding="utf-8", errors="replace")[:500]
+              except OSError:
+                  return False
+              return "yarn lockfile v1" in head
+
+
+          def _parse_semver(text, prefix):
+              m = re.match(rf"{prefix}(\d+)\.(\d+)(?:\.(\d+))?", text or "")
+              return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else None
+
+
+          def detect_version(root, project):
+              """Version Yarn via packageManager, yarnPath ou .yarn/releases (le plus proche gagne)."""
+              for cur in chain(project):
+                  pkg = root / cur / "package.json"
+                  if pkg.exists():
+                      try:
+                          pm = json.loads(pkg.read_text(encoding="utf-8")).get("packageManager") or ""
+                      except (ValueError, OSError, AttributeError):
+                          pm = ""
+                      ver = _parse_semver(str(pm), "yarn@")
+                      if ver:
+                          return ver
+                  rc = root / cur / ".yarnrc.yml"
+                  if rc.exists():
+                      try:
+                          cfg = yaml.safe_load(rc.read_text(encoding="utf-8")) or {}
+                          ver = _parse_semver(Path(str(cfg.get("yarnPath", ""))).name, "yarn-")
+                          if ver:
+                              return ver
+                      except (yaml.YAMLError, AttributeError, OSError):
+                          pass
+                  releases = root / cur / ".yarn" / "releases"
+                  if releases.is_dir():
+                      for f in sorted(releases.glob("yarn-*.cjs")):
+                          ver = _parse_semver(f.name, "yarn-")
+                          if ver:
+                              return ver
+              return None
+
+
+          def load_config(root, project):
+              """Fusionne les .yarnrc.yml de la racine vers le projet (comme Yarn : le plus proche gagne).
+
+              Retourne (config_fusionnee, {cle: fichier_qui_la_definit}, erreurs_yaml).
+              """
+              merged, origin, errors = {}, {}, []
+              for cur in reversed(chain(project)):
+                  rc = root / cur / ".yarnrc.yml"
+                  if not rc.exists():
+                      continue
+                  try:
+                      cfg = yaml.safe_load(rc.read_text(encoding="utf-8")) or {}
+                  except yaml.YAMLError:
+                      errors.append(rc.relative_to(root).as_posix())
+                      continue
+                  if isinstance(cfg, dict):
+                      for k, v in cfg.items():
+                          merged[k] = v
+                          origin[k] = rc.relative_to(root).as_posix()
+              return merged, origin, errors
+
+
+          def is_false(value):
+              return value is False or str(value).strip().strip("\"'").lower() == "false"
+
+
+          def gate_minutes(value, version):
+              """npmMinimalAgeGate tel que Yarn `version` l'interprete, en minutes.
+
+              Retourne (minutes | None, raison_si_None).
+              """
+              if isinstance(value, bool) or value is None:
+                  return None, "valeur absente ou invalide"
+              if isinstance(value, (int, float)):
+                  return float(value), None
+              text = str(value).strip().lower()
+              if re.fullmatch(r"\d+", text):
+                  return float(text), None
+              if version is None or version < DURATION_VERSION:
+                  as_parsed = int(re.match(r"\d*", text).group() or 0)  # comportement parseInt de Yarn < 4.12
+                  return None, (f"duree texte {value!r} non supportee par Yarn {fmt_version(version)} "
+                                f"(< 4.12, lue comme {as_parsed} minute(s)) "
+                                f"- utiliser le nombre de minutes {MIN_AGE_MINUTES}")
+              matches = re.findall(r"(\d+)\s*([wdhms])", text)
+              if not matches or re.sub(r"(\d+)\s*([wdhms])|\s+", "", text):
+                  return None, f"duree illisible {value!r}"
+              return sum(int(n) * _UNITS[u] for n, u in matches), None
+
+
+          def evaluate(root, project):
+              """Evalue un projet. Retourne (statut, problemes).
+
+              statut : "classic" | "unknown_version" | "old_version" | "checked"
+              problemes : liste de (message, fichier, cle) pour un projet "checked".
+              """
+              if is_classic(root, project):
+                  return "classic", []
+              version = detect_version(root, project)
+              if version is None:
+                  return "unknown_version", []
+              if version < MIN_VERSION:
+                  return "old_version", []
+              cfg, origin, yaml_errors = load_config(root, project)
+              if yaml_errors:
+                  return "checked", [(f"`{f}` illisible (YAML invalide).", f, None) for f in yaml_errors]
+              problems = []
+              rc_default = (project / ".yarnrc.yml").as_posix()
+
+              if "enableScripts" not in cfg:
+                  problems.append(("`enableScripts` absent - ajouter `enableScripts: false`.",
+                                   rc_default, "enableScripts"))
+              elif not is_false(cfg["enableScripts"]):
+                  problems.append((f"`enableScripts` doit valoir false (trouve : {cfg['enableScripts']!r}).",
+                                   origin["enableScripts"], "enableScripts"))
+
+              if "npmMinimalAgeGate" not in cfg:
+                  problems.append((f"`npmMinimalAgeGate` absent - ajouter `npmMinimalAgeGate: {MIN_AGE_MINUTES}`.",
+                                   rc_default, "npmMinimalAgeGate"))
+              else:
+                  minutes, reason = gate_minutes(cfg["npmMinimalAgeGate"], version)
+                  if minutes is None:
+                      problems.append((f"`npmMinimalAgeGate` : {reason}.",
+                                       origin["npmMinimalAgeGate"], "npmMinimalAgeGate"))
+                  elif minutes < MIN_AGE_MINUTES:
+                      problems.append((f"`npmMinimalAgeGate` ({cfg['npmMinimalAgeGate']}) < minimum requis "
+                                       f"({MIN_AGE_MINUTES} minutes).",
+                                       origin["npmMinimalAgeGate"], "npmMinimalAgeGate"))
+              return "checked", problems
+
+
+          # --------------------------------------------------------------------------
+          # Check (lecture seule) : emet des annotations GitHub et echoue si besoin.
+          # --------------------------------------------------------------------------
+
+
+          def _esc_data(s):
+              return str(s).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+          def _esc_prop(s):
+              return _esc_data(s).replace(":", "%3A").replace(",", "%2C")
+
+
+          def annotate(msg, file=None, line=None):
+              props = []
+              if file:
+                  props.append(f"file={_esc_prop(file)}")
+              if line:
+                  props.append(f"line={int(line)}")
+              print((f"::error {','.join(props)}::" if props else "::error::") + _esc_data(msg))
+
+
+          def line_of(root, file, key):
+              if not key:
+                  return 1
+              try:
+                  for i, raw in enumerate((root / file).read_text(encoding="utf-8").splitlines(), 1):
+                      if re.match(rf"^{re.escape(key)}\s*:", raw):
+                          return i
+              except OSError:
+                  pass
+              return 1
+
+
+          def main():
+              root = Path(".").resolve()
+              projects = find_projects(root)
+              if not projects:
+                  print("Aucun yarn.lock : rien a verifier.")
+                  return 0
+              print("Projets yarn : " + ", ".join(p.as_posix() for p in projects))
+              errors = 0
+              for project in projects:
+                  rel = project.as_posix()
+                  pkg = (project / "package.json").as_posix()
+                  status, problems = evaluate(root, project)
+                  if status == "classic":
+                      annotate(f"[{rel}] Yarn Classic (v1) ne supporte ni `enableScripts` ni "
+                               f"`npmMinimalAgeGate` - migrer vers Yarn >= {fmt_version(MIN_VERSION)}.",
+                               (project / "yarn.lock").as_posix(), 1)
+                      errors += 1
+                  elif status == "unknown_version":
+                      annotate(f"[{rel}] version de Yarn indeterminable - declarer "
+                               f"`\"packageManager\": \"yarn@x.y.z\"` dans package.json.", pkg, 1)
+                      errors += 1
+                  elif status == "old_version":
+                      ver = detect_version(root, project)
+                      annotate(f"[{rel}] Yarn {fmt_version(ver)} < {fmt_version(MIN_VERSION)} - mettre a jour "
+                               f"(`yarn set version stable`).", pkg, 1)
+                      errors += 1
+                  for msg, file, key in problems:
+                      annotate(f"[{rel}] {msg}", file, line_of(root, file, key))
+                      errors += 1
+              if errors:
+                  print(f"\n{errors} erreur(s). Config attendue : enableScripts: false + "
+                        f"npmMinimalAgeGate: {MIN_AGE_MINUTES} (Yarn >= {fmt_version(MIN_VERSION)}).")
+                  return 1
+              print("Conf yarn durcie : OK.")
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+          python3 -I -B "${RUNNER_TEMP}/check_yarn_hardening.py"
