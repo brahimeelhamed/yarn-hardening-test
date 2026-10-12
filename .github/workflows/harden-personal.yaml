@@ -1,0 +1,392 @@
+name: Harden Yarn Config (test perso)
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: "Repos a traiter (separes par des espaces, 'repo' ou 'padoa/repo'). Vide = tout l'org."
+        required: false
+        default: ''
+      apply:
+        description: "Ouvrir reellement les PR de durcissement (sinon dry-run)."
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: harden-yarn-config
+  cancel-in-progress: false
+
+jobs:
+  harden:
+    name: Harden yarn config
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      ORG: ${{ github.repository_owner }}
+      MIN_VERSION: '4.10.3'
+    steps:
+      - name: Harden yarn config
+        env:
+          GH_TOKEN: ${{ secrets.YARN_PAT }}
+          REPOS: ${{ inputs.repos }}
+          APPLY: ${{ inputs.apply }}
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/harden_yarn_config.py" <<'PY'
+          """Durcissement Yarn : ouvre une PR sur les repos prets, resume les autres."""
+          import base64
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+
+          API = "https://api.github.com"
+          API_VERSION = "2026-03-10"
+          TIMEOUT = 30
+          MAX_ATTEMPTS = 4
+
+          TOKEN = os.environ["GH_TOKEN"]
+          ORG = os.environ.get("ORG", "padoa")
+          # Accepte "repo" comme "padoa/repo".
+          ONLY = [r.strip("/").split("/")[-1] for r in os.environ.get("REPOS", "").split() if r.strip("/")]
+          MIN_VERSION = tuple(int(x) for x in os.environ.get("MIN_VERSION", "4.10.3").split("."))
+          APPLY = os.environ.get("APPLY", "false").strip().lower() == "true"
+
+          MIN_AGE = 4320
+          HARDEN_BRANCH = "chore/yarn-hardening"
+          HEADER = "# Durcissement supply-chain Yarn (ruleset Check Yarn Hardening).\n"
+          ADDITION = "enableScripts: false\nnpmMinimalAgeGate: 4320 # minutes = 3 jours\n"
+          PR_TITLE = "chore: durcissement supply-chain Yarn (.yarnrc.yml)"
+          COMMIT_MSG = PR_TITLE
+          PR_BODY = (
+              "Ajoute `enableScripts: false` et `npmMinimalAgeGate: 4320` (3 jours) dans "
+              "`.yarnrc.yml`, pour reduire l'exposition aux attaques supply-chain npm.\n\n"
+              "Impose a l'org par le ruleset **Check Yarn Hardening**. PR generee par le "
+              "workflow `harden-yarn-config` de ci-tools."
+          )
+
+
+          class ApiError(Exception):
+              """Erreur API inattendue (ni succes, ni 'absent')."""
+
+
+          def fmt(ver):
+              return ".".join(map(str, ver)) if ver else "inconnue"
+
+
+          def retry_delay(status, headers, attempt):
+              """Delai avant nouvel essai, ou None si l'erreur n'est pas transitoire."""
+              rate_limited = status == 403 and (
+                  headers.get("Retry-After") or headers.get("X-RateLimit-Remaining") == "0")
+              if status not in (0, 429, 500, 502, 503, 504) and not rate_limited:
+                  return None
+              retry_after = headers.get("Retry-After") or ""
+              if retry_after.isdigit():
+                  return min(int(retry_after), 60)
+              reset = headers.get("X-RateLimit-Reset") or ""
+              if headers.get("X-RateLimit-Remaining") == "0" and reset.isdigit():
+                  wait = int(reset) - int(time.time()) + 1
+                  return max(1, wait) if wait <= 120 else None  # quota epuise pour longtemps : on abandonne
+              return 2 ** attempt
+
+
+          def request(url, raw=False, method="GET", payload=None):
+              """Appel API GitHub. Retourne (status, body, link). status=0 = erreur reseau.
+
+              Seuls les GET sont rejoues (les ecritures ne sont pas idempotentes).
+              """
+              if not url.startswith("http"):
+                  url = API + url  # les URLs de pagination (header Link) sont deja absolues
+              data = json.dumps(payload).encode() if payload is not None else None
+              attempts = MAX_ATTEMPTS if method == "GET" else 1
+              for attempt in range(1, attempts + 1):
+                  req = urllib.request.Request(url, data=data, method=method)
+                  req.add_header("Authorization", f"Bearer {TOKEN}")
+                  req.add_header("X-GitHub-Api-Version", API_VERSION)
+                  req.add_header("Accept",
+                                 "application/vnd.github.raw" if raw else "application/vnd.github+json")
+                  if data is not None:
+                      req.add_header("Content-Type", "application/json")
+                  try:
+                      with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                          return resp.status, resp.read(), resp.headers.get("Link", "")
+                  except urllib.error.HTTPError as err:
+                      status, body, headers = err.code, err.read(), err.headers
+                  except OSError as err:  # URLError, timeout, connexion coupee
+                      status, body, headers = 0, str(err).encode(), {}
+                  delay = retry_delay(status, headers, attempt) if method == "GET" else None
+                  if delay is None or attempt == attempts:
+                      return status, body, ""
+                  print(f"::warning::HTTP {status} sur {url}, nouvel essai dans {delay}s.")
+                  time.sleep(delay)
+              return 0, b"", ""  # inatteignable
+
+
+          def api_json(url, method="GET", payload=None):
+              status, body, _ = request(url, method=method, payload=payload)
+              try:
+                  return status, (json.loads(body) if body else {})
+              except ValueError:
+                  return status, {}
+
+
+          def list_repos():
+              repos, url = [], f"/orgs/{ORG}/repos?per_page=100&type=all"
+              while url:
+                  status, body, link = request(url)
+                  if status != 200:
+                      print(f"::error::Impossible de lister les repos de {ORG} (HTTP {status}).")
+                      sys.exit(1)
+                  for repo in json.loads(body):
+                      if not repo.get("archived"):
+                          repos.append(repo["name"])
+                  url = None
+                  for part in link.split(","):
+                      if 'rel="next"' in part:
+                          url = part[part.find("<") + 1:part.find(">")]
+              return sorted(repos)
+
+
+          def get_contents(repo, path, raw):
+              """Contenu (ou listing) de path. None si absent (404) ou repo vide (409)."""
+              status, body, _ = request(f"/repos/{ORG}/{repo}/contents/{path}", raw=raw)
+              if status == 200:
+                  return body
+              if status in (404, 409):
+                  return None
+              raise ApiError(f"{path} : HTTP {status or 'reseau'}")
+
+
+          def parse_semver(text, prefix):
+              m = re.match(rf"{re.escape(prefix)}(\d+)\.(\d+)(?:\.(\d+))?", text or "")
+              return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else None
+
+
+          def detect_version(repo):
+              pkg = get_contents(repo, "package.json", raw=True)
+              if pkg:
+                  try:
+                      pm = json.loads(pkg).get("packageManager") or ""
+                      ver = parse_semver(str(pm), "yarn@")
+                      if ver:
+                          return ver
+                  except (ValueError, AttributeError):
+                      pass
+              rc = get_contents(repo, ".yarnrc.yml", raw=True)
+              if rc:
+                  m = re.search(r"(yarn-\d+\.\d+(?:\.\d+)?)", rc.decode("utf-8", "replace"))
+                  if m:
+                      ver = parse_semver(m.group(1), "yarn-")
+                      if ver:
+                          return ver
+              listing = get_contents(repo, ".yarn/releases", raw=False)
+              if listing:
+                  try:
+                      for entry in json.loads(listing):
+                          ver = parse_semver(entry["name"], "yarn-")
+                          if ver:
+                              return ver
+                  except (ValueError, KeyError, TypeError):
+                      pass
+              return None
+
+
+          def lockfile_hint(lock):
+              """Indice a partir du __metadata d'un lockfile Berry quand la version exacte manque."""
+              m = re.search(rb"^__metadata:\s*\n\s+version:\s*(\d+)", lock[:2000], re.MULTILINE)
+              if not m:
+                  return "inconnue"
+              lf = int(m.group(1))
+              return f"inconnue (lockfile v{lf}{', Yarn 4.x' if lf >= 8 else ''})"
+
+
+          def conf_state(rc_bytes):
+              """Etat de la conf de durcissement dans .yarnrc.yml.
+
+              "absent"  : pas de .yarnrc.yml
+              "none"    : fichier present, aucun des 2 flags -> ajout sur (append)
+              "ok"      : les 2 flags presents et corrects
+              "partial" : un flag present / mauvaise valeur -> intervention manuelle
+              """
+              if rc_bytes is None:
+                  return "absent"
+              text = rc_bytes.decode("utf-8", "replace")
+              es = re.search(r"(?m)^enableScripts:\s*(\S+)", text)
+              ag = re.search(r"(?m)^npmMinimalAgeGate:\s*(\S+)", text)
+              if es is None and ag is None:
+                  return "none"
+              es_ok = es is not None and es.group(1).strip("'\"").lower() == "false"
+              ag_ok = ag is not None and ag.group(1).isdigit() and int(ag.group(1)) >= MIN_AGE
+              return "ok" if (es_ok and ag_ok) else "partial"
+
+
+          def classify(repo):
+              """Retourne (statut, detail, extra) ou None si pas de yarn.lock a la racine.
+
+              Pour "ready", extra = (etat_conf, contenu_yarnrc | None).
+              """
+              lock = get_contents(repo, "yarn.lock", raw=True)
+              if lock is None:
+                  return None
+              if b"yarn lockfile v1" in lock[:500]:
+                  return "classic", "1.x", None
+              version = detect_version(repo)
+              if version is None:
+                  return "unknown", lockfile_hint(lock), None
+              if version < MIN_VERSION:
+                  return "old", fmt(version), None
+              rc = get_contents(repo, ".yarnrc.yml", raw=True)
+              return "ready", fmt(version), (conf_state(rc), rc)
+
+
+          def open_hardening_pr(repo, rc_bytes):
+              """Ouvre une PR ajoutant les 2 flags. Retourne l'URL, ou None si deja en cours."""
+              status, meta = api_json(f"/repos/{ORG}/{repo}")
+              if status != 200:
+                  raise ApiError(f"meta repo HTTP {status}")
+              base = meta["default_branch"]
+
+              status, _ = api_json(f"/repos/{ORG}/{repo}/git/ref/heads/{HARDEN_BRANCH}")
+              if status == 200:
+                  return None  # branche deja la : PR probablement deja ouverte
+
+              status, ref = api_json(f"/repos/{ORG}/{repo}/git/ref/heads/{base}")
+              if status != 200:
+                  raise ApiError(f"ref {base} HTTP {status}")
+              base_sha = ref["object"]["sha"]
+
+              status, _ = api_json(f"/repos/{ORG}/{repo}/git/refs", "POST",
+                                   {"ref": f"refs/heads/{HARDEN_BRANCH}", "sha": base_sha})
+              if status not in (200, 201):
+                  raise ApiError(f"creation branche HTTP {status}")
+
+              if rc_bytes is not None:
+                  new_text = rc_bytes.decode("utf-8", "replace").rstrip("\n") + "\n\n" + ADDITION
+                  status, cur = api_json(f"/repos/{ORG}/{repo}/contents/.yarnrc.yml?ref={base}")
+                  file_sha = cur.get("sha") if status == 200 else None
+              else:
+                  new_text = HEADER + ADDITION
+                  file_sha = None
+
+              put = {"message": COMMIT_MSG, "branch": HARDEN_BRANCH,
+                     "content": base64.b64encode(new_text.encode()).decode()}
+              if file_sha:
+                  put["sha"] = file_sha
+              status, _ = api_json(f"/repos/{ORG}/{repo}/contents/.yarnrc.yml", "PUT", put)
+              if status not in (200, 201):
+                  raise ApiError(f"ecriture .yarnrc.yml HTTP {status}")
+
+              status, pr = api_json(f"/repos/{ORG}/{repo}/pulls", "POST",
+                                    {"title": PR_TITLE, "head": HARDEN_BRANCH, "base": base, "body": PR_BODY})
+              if status not in (200, 201):
+                  raise ApiError(f"creation PR HTTP {status}")
+              return pr.get("html_url", "PR creee")
+
+
+          LABELS = {
+              "opened": "🟢 Durcissement (PR)",
+              "manual": "🟡 A durcir a la main",
+              "old": "🟠 A migrer (< cible)",
+              "classic": "🔴 Yarn Classic (v1)",
+              "unknown": "❔ Version inconnue",
+              "conforme": "✅ Deja conforme",
+              "error": "⚠️ Erreur API",
+          }
+          COLS = {
+              "opened": "PR", "manual": "Note", "old": "Version Yarn",
+              "classic": "Version Yarn", "unknown": "Version Yarn",
+              "conforme": "Version Yarn", "error": "Erreur",
+          }
+          ORDER = ["opened", "manual", "old", "classic", "unknown", "conforme", "error"]
+
+
+          def main():
+              repos = ONLY or list_repos()
+              mode = "APPLY (ouverture de PR)" if APPLY else "DRY-RUN (rapport seul)"
+              print(f"{len(repos)} repo(s) a traiter — mode {mode}.")
+              rows = {k: [] for k in LABELS}
+              for repo in repos:
+                  try:
+                      result = classify(repo)
+                  except ApiError as err:
+                      rows["error"].append((repo, str(err)))
+                      continue
+                  if result is None:
+                      continue  # pas un projet Yarn
+                  status, detail, extra = result
+                  if status != "ready":
+                      rows[status].append((repo, detail))
+                      continue
+                  state, rc = extra
+                  if state == "ok":
+                      rows["conforme"].append((repo, detail))
+                  elif state == "partial":
+                      rows["manual"].append((repo, f"{detail} — conf a revoir"))
+                  elif not APPLY:
+                      st, _ = api_json(f"/repos/{ORG}/{repo}/git/ref/heads/{HARDEN_BRANCH}")
+                      note = "PR deja ouverte (branche existante)" if st == 200 else "PR a ouvrir (dry-run)"
+                      rows["opened"].append((repo, note))
+                  else:
+                      try:
+                          url = open_hardening_pr(repo, rc)
+                      except ApiError as err:
+                          rows["error"].append((repo, str(err)))
+                          continue
+                      rows["opened"].append((repo, url or "branche deja existante"))
+
+              yarn_total = sum(len(v) for k, v in rows.items() if k != "error")
+              lines = ["# Deploiement du durcissement Yarn", ""]
+              lines.append(f"Mode : **{mode}**. **{yarn_total} repo(s) Yarn** "
+                           f"(yarn.lock a la racine). Cible : Yarn >= {fmt(MIN_VERSION)}.")
+              if rows["error"]:
+                  lines.append("")
+                  lines.append(f"> ⚠️ {len(rows['error'])} repo(s) en erreur API : traitement incomplet.")
+              lines.append("")
+              lines.append("| Statut | Nombre |")
+              lines.append("| --- | --- |")
+              for key in ORDER:
+                  lines.append(f"| {LABELS[key]} | {len(rows[key])} |")
+              migrate = len(rows["old"]) + len(rows["classic"]) + len(rows["unknown"])
+              if migrate:
+                  lines.append("")
+                  lines.append(f"> {migrate} repo(s) doivent d'abord monter de version "
+                               "(suivi : workflow `flag-yarn-outdated`).")
+              lines.append("")
+              # On ne detaille que les repos sur lesquels ce workflow agit ; les repos a
+              # migrer sont suivis par flag-yarn-outdated.
+              for key in ("opened", "manual", "conforme", "error"):
+                  if not rows[key]:
+                      continue
+                  lines.append(f"## {LABELS[key]} ({len(rows[key])})")
+                  lines.append("")
+                  lines.append(f"| Repo | {COLS[key]} |")
+                  lines.append("| --- | --- |")
+                  for name, detail in sorted(rows[key]):
+                      cell = str(detail).replace("|", "\\|")
+                      lines.append(f"| `{name}` | {cell} |")
+                  lines.append("")
+              report = "\n".join(lines)
+
+              out = os.environ.get("GITHUB_STEP_SUMMARY")
+              if out:
+                  with open(out, "a", encoding="utf-8") as fh:
+                      fh.write(report + "\n")
+              print(report)
+
+              if rows["error"]:
+                  print(f"::error::{len(rows['error'])} repo(s) en erreur API, traitement incomplet.")
+                  return 1
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
+          python3 -I -B "${RUNNER_TEMP}/harden_yarn_config.py"
